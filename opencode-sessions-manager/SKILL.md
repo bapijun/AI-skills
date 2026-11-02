@@ -1,6 +1,6 @@
 ---
 name: opencode-sessions-manager
-version: 0.0.2
+version: 0.0.3
 description: |
   交互式 opencode 会话选择器 - 分页浏览恢复历史会话
   触发场景：
@@ -81,6 +81,11 @@ source "$RC_FILE"
 [dvlproadHexo的《AI-③opencode会话管理》](https://dvlproad.github.io/AI/AI-③opencode会话管理/)
 
 ## 版本记录
+
+### 0.0.3 (2026-11-02): 适配 opencode v2
+
+- opencode v2 数据库结构变更：`session` → `session_v2`；`message`+`part` 两表合并为 `session_message`（`type='user'`，按 `seq` 排序，`data` JSON 的 `$.text` 直接是输入内容）
+- 已在 v2.1.4 上实测通过；不兼容 v1 及更早数据库
 
 ### 0.0.2 (2026-05-20): 改进版本
 

@@ -18,6 +18,8 @@ export DB="$HOME/.local/share/opencode/opencode.db"
 # 有参数 → 透传
 # 无参数 → 弹会话列表（选一个恢复 / 回车开新 / q 退出）
 # 分页取数：每次只查一页（默认10条），避免一次查30条。
+# ⚠️ opencode v2 数据库结构变更：session → session_v2；
+#    message+part 两表合并为 session_message（type='user'，按 seq 排序，data JSON 含 $.text）
 # 每条记录含3个关联子查询（首条/倒二/末条用户消息），
 # 查10条 = 30次子查询，查30条 = 90次子查询。
 _oc_session_q() {
@@ -26,38 +28,32 @@ _oc_session_q() {
         SELECT s.id || '│' ||
                COALESCE(p.name, s.directory, '?') || '│' ||
                COALESCE(s.title, '') || '│' ||
-               COALESCE(substr(replace((SELECT json_extract(pt.data, '$.text')
-                                         FROM message m2
-                                         JOIN part pt ON pt.message_id = m2.id
-                                         WHERE m2.session_id = s.id
-                                           AND json_extract(m2.data, '$.role') = 'user'
-                                           AND json_extract(pt.data, '$.type') = 'text'
-                                         ORDER BY m2.time_created ASC, pt.time_created ASC
+               COALESCE(substr(replace((SELECT json_extract(sm.data, '$.text')
+                                         FROM session_message sm
+                                         WHERE sm.session_id = s.id
+                                           AND sm.type = 'user'
+                                         ORDER BY sm.seq ASC
                                          LIMIT 1), char(10), ' '), 1, 40), '') || '│' ||
-               COALESCE(substr(replace((SELECT json_extract(pt.data, '$.text')
-                                         FROM message m2
-                                         JOIN part pt ON pt.message_id = m2.id
-                                         WHERE m2.session_id = s.id
-                                           AND json_extract(m2.data, '$.role') = 'user'
-                                           AND json_extract(pt.data, '$.type') = 'text'
-                                         ORDER BY m2.time_created DESC, pt.time_created ASC
+               COALESCE(substr(replace((SELECT json_extract(sm.data, '$.text')
+                                         FROM session_message sm
+                                         WHERE sm.session_id = s.id
+                                           AND sm.type = 'user'
+                                         ORDER BY sm.seq DESC
                                          LIMIT 1 OFFSET 1), char(10), ' '), 1, 40), '') || '│' ||
-               COALESCE(substr(replace((SELECT json_extract(pt.data, '$.text')
-                                         FROM message m2
-                                         JOIN part pt ON pt.message_id = m2.id
-                                         WHERE m2.session_id = s.id
-                                           AND json_extract(m2.data, '$.role') = 'user'
-                                           AND json_extract(pt.data, '$.type') = 'text'
-                                         ORDER BY m2.time_created DESC, pt.time_created ASC
+               COALESCE(substr(replace((SELECT json_extract(sm.data, '$.text')
+                                         FROM session_message sm
+                                         WHERE sm.session_id = s.id
+                                           AND sm.type = 'user'
+                                         ORDER BY sm.seq DESC
                                          LIMIT 1), char(10), ' '), 1, 40), '')
-        FROM session s
+        FROM session_v2 s
         LEFT JOIN project p ON s.project_id = p.id
         ORDER BY s.time_updated DESC LIMIT $limit OFFSET $offset;
     "
 }
 
 _oc_session_count() {
-    sqlite3 "$DB" "SELECT COUNT(*) FROM session;"
+    sqlite3 "$DB" "SELECT COUNT(*) FROM session_v2;"
 }
 
 opencode_list() {
