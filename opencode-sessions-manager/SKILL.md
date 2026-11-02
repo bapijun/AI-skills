@@ -1,6 +1,6 @@
 ---
 name: opencode-sessions-manager
-version: 0.0.3
+version: 0.0.4
 description: |
   交互式 opencode 会话选择器 - 分页浏览恢复历史会话
   触发场景：
@@ -81,6 +81,13 @@ source "$RC_FILE"
 [dvlproadHexo的《AI-③opencode会话管理》](https://dvlproad.github.io/AI/AI-③opencode会话管理/)
 
 ## 版本记录
+
+### 0.0.4 (2026-11-02): v1/v2 版本自适应
+
+- 惰性探测：首次调用时查 `sqlite_master` 有无 `session_v2` 表（比解析 `opencode --version` 更可靠——查的就是 DB，判断依据与数据本身绑定），结果缓存到 `_OC_DB_V2`
+- `_OC_DB_V2=1` 走 v2 SQL（`session_v2`/`session_message`），`=0` 走 v1 SQL（0.0.2 原版 `session`/`message`/`part`），同一份脚本兼容两代数据库
+- DB 文件不存在时短路返回空，`opencode_list` 总数 0 时直接开新会话，不再报 `no such table`
+- 已验证：v2 真实库 / 假 v1 库 / 无 DB 三种场景
 
 ### 0.0.3 (2026-11-02): 适配 opencode v2
 
