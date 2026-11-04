@@ -3,12 +3,19 @@
  *
  * Injects AI-qskills bootstrap context via system prompt transform.
  * Skills are discovered via OpenCode's native skill tool from symlinked directory.
+ *
+ * ⚠️ opencode v2 插件 API 适配（2026-11-04）：
+ * V1 的命名导出 hook 写法在 v2 加载失败：
+ *   "Plugin must export a default definition with an id and an effect or setup function"
+ * 迁移为 V2 的 default Plugin.define：
+ *   - `experimental.chat.system.transform` → `ctx.session.hook("context")`，system 元素为 { type: "text", text } 结构
+ *   详见 https://opencode.ai/v2/docs/build/plugins/migrate-v1
  */
 
 import path from 'path';
 import fs from 'fs';
-import os from 'os';
 import { fileURLToPath } from 'url';
+import { Plugin } from '@opencode/plugin';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -32,46 +39,32 @@ const extractAndStripFrontmatter = (content) => {
   return { frontmatter, content: body };
 };
 
-const normalizePath = (p, homeDir) => {
-  if (!p || typeof p !== 'string') return null;
-  let normalized = p.trim();
-  if (!normalized) return null;
-  if (normalized.startsWith('~/')) {
-    normalized = path.join(homeDir, normalized.slice(2));
-  } else if (normalized === '~') {
-    normalized = homeDir;
-  }
-  return path.resolve(normalized);
-};
+const skillsDir = path.resolve(__dirname, '../../skills');
 
-export const AIQskillsPlugin = async ({ client, directory }) => {
-  const homeDir = os.homedir();
-  const skillsDir = path.resolve(__dirname, '../../skills');
-  const envConfigDir = normalizePath(process.env.OPENCODE_CONFIG_DIR, homeDir);
-  const configDir = envConfigDir || path.join(homeDir, '.config/opencode');
+const getBootstrapContent = () => {
+  const skillPath = path.join(skillsDir, 'life-reply-crush', 'SKILL.md');
+  if (!fs.existsSync(skillPath)) return null;
 
-  const getBootstrapContent = () => {
-    const skillPath = path.join(skillsDir, 'life-reply-crush', 'SKILL.md');
-    if (!fs.existsSync(skillPath)) return null;
+  const fullContent = fs.readFileSync(skillPath, 'utf8');
+  const { content } = extractAndStripFrontmatter(fullContent);
 
-    const fullContent = fs.readFileSync(skillPath, 'utf8');
-    const { content } = extractAndStripFrontmatter(fullContent);
-
-    return `<EXTREMELY_IMPORTANT>
+  return `<EXTREMELY_IMPORTANT>
 You have AI-qskills.
 
 **IMPORTANT: The life-reply-crush skill content is included below. It is ALREADY LOADED - you are currently following it. Do NOT use the skill tool to load "life-reply-crush" again - that would be redundant.**
 
 ${content}
 </EXTREMELY_IMPORTANT>`;
-  };
+};
 
-  return {
-    'experimental.chat.system.transform': async (_input, output) => {
+export default Plugin.define({
+  id: 'ai-qskills',
+  async setup(ctx) {
+    await ctx.session.hook('context', (event) => {
       const bootstrap = getBootstrapContent();
       if (bootstrap) {
-        (output.system ||= []).push(bootstrap);
+        event.system.push({ type: 'text', text: bootstrap });
       }
-    }
-  };
-};
+    });
+  },
+});

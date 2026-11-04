@@ -6,11 +6,11 @@
 
 ## Installation
 
-Add AI-qskills to the `plugin` array in your `opencode.json` (global or project-level):
+Add AI-qskills to the `plugins` array in your `opencode.json` (global or project-level):
 
 ```json
 {
-  "plugin": ["ai-qskills@git+https://github.com/[你的github用户名]/AI-qskills.git"]
+  "plugins": ["ai-qskills@git+https://github.com/[你的github用户名]/AI-qskills.git"]
 }
 ```
 
@@ -45,6 +45,6 @@ To pin a specific version:
 
 ```json
 {
-  "plugin": ["ai-qskills@git+https://github.com/[你的github用户名]/AI-qskills.git#v1.0.0"]
+  "plugins": ["ai-qskills@git+https://github.com/[你的github用户名]/AI-qskills.git#v1.0.0"]
 }
 ```
