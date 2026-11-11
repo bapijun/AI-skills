@@ -111,12 +111,28 @@ _oc_session_count() {
     fi
 }
 
+# 删除会话（走官方命令：级联删子会话+事件表+session_message/inbox/pending，不手写 SQL；仅 v2 提供删除入口）
+# 成功静默返回 0；失败把官方错误存入 derr（调用者的 local，zsh 动态作用域）并返回 1
+_oc_session_delete() {
+    derr=""
+    if derr=$(command opencode session delete "$1" 2>&1); then
+        derr=""
+        return 0
+    fi
+    return 1
+}
+
 
 opencode_list() {
     if [ $# -gt 0 ]; then
         command opencode "$@"
         return
     fi
+
+    # zsh 的 local 在变量已存在时重复声明会打印旧值（typeset_silent 默认关闭），
+    # 而 while 循环每轮都重新 local rows/page_count → 第 2 页起每次翻页都会喷脏数据。
+    # 只影响本函数作用域。
+    setopt localoptions typeset_silent
 
     local sid
     local per_page=10
@@ -161,6 +177,7 @@ opencode_list() {
         local prompt="输入序号恢复"
         [[ $page -lt $total_pages ]] && prompt="${prompt}，\033[33mn\033[35m=下一页"
         [[ $page -gt 1 ]] && prompt="${prompt}，\033[33mp\033[35m=上一页"
+        [[ "$_OC_DB_V2" = "1" ]] && prompt="${prompt}，\033[33md\033[35m=删除"
         prompt="${prompt}，直接回车=新会话，\033[33mq\033[35m=退出: "
         echo -ne "\033[35m${prompt}\033[0m"
         read -r reply
@@ -169,9 +186,80 @@ opencode_list() {
             q|Q) return ;;
             n|N) [[ $page -lt $total_pages ]] && ((page++)) && continue ;;
             p|P) [[ $page -gt 1 ]] && ((page--)) && continue ;;
+            d|D)
+                # 批量删除（仅 v2）：单个 3 / 多个 3 5 8 / 区间 2-5 / 混合 2-5 8；仅当前页有效，空格分隔
+                if [ "$_OC_DB_V2" != "1" ]; then echo "ℹ️ 当前为 v1 环境，不支持删除（仅 v2 提供该功能）" ; continue ; fi
+                setopt localoptions noglob
+                local del_reply tok from to t n bad yn okc failc dsid dproj dttl dup s derr
+                local -a del_nums del_sids
+                del_nums=() ; del_sids=() ; bad=0
+                echo -ne "\033[35m删除序号(单个 3 / 多个 3 5 8 / 区间 2-5 / 混合 2-5 8，当前页内)，回车取消: \033[0m"
+                read -r del_reply
+                [ -z "$del_reply" ] && continue
+                # 解析 + 严格校验：任何非法 token 整批拒绝，绝不部分执行
+                for tok in ${=del_reply}; do
+                    if [[ "$tok" =~ ^[1-9][0-9]*$ ]]; then
+                        n=$tok
+                        if [ "$n" -lt 1 ] || [ "$n" -gt "$page_count" ]; then
+                            echo "❌ 序号 $n 超出当前页范围 1-$page_count" ; bad=1 ; break
+                        fi
+                        del_nums+=("$n")
+                    elif [[ "$tok" =~ ^[1-9][0-9]*-[1-9][0-9]*$ ]]; then
+                        from=${tok%-*} ; to=${tok#*-}
+                        [ "$from" -gt "$to" ] && { t=$from ; from=$to ; to=$t ; }
+                        if [ "$from" -lt 1 ] || [ "$to" -gt "$page_count" ]; then
+                            echo "❌ 区间 $tok 超出当前页范围 1-$page_count" ; bad=1 ; break
+                        fi
+                        for ((n=from; n<=to; n++)); do del_nums+=("$n"); done
+                    else
+                        echo "❌ 无法识别 \"$tok\"（语法: 单个 3 / 多个 3 5 8 / 区间 2-5，空格分隔，不支持前导零）" ; bad=1 ; break
+                    fi
+                done
+                [ "$bad" = "1" ] && continue
+                # 预览 + 按 sid 去重（避免 "3 2-4" 里 3 重复删）
+                echo "将删除以下会话(含其子会话):"
+                for n in "${del_nums[@]}"; do
+                    dsid=$(echo "${rows[$n]}" | awk -F'│' '{print $1}')
+                    dproj=$(echo "${rows[$n]}" | awk -F'│' '{print $2}')
+                    dttl=$(echo "${rows[$n]}" | awk -F'│' '{print $3}')
+                    dup=0
+                    for s in "${del_sids[@]}"; do [ "$s" = "$dsid" ] && dup=1 && break; done
+                    if [ "$dup" = "0" ]; then
+                        del_sids+=("$dsid")
+                        printf "  %2d) \033[1;36m[%s]\033[0m \033[1;32m%s\033[0m\n" "$n" "${dproj:-?}" "${dttl:-}"
+                    fi
+                done
+                # 统一 y/N 确认一次
+                echo -ne "\033[35m确认删除以上 ${#del_sids[@]} 个会话? y/N: \033[0m"
+                read -r yn
+                [[ "$yn" =~ ^[yY]$ ]] || { echo "已取消删除" ; continue ; }
+                # 逐条删除，统计成败
+                okc=0 ; failc=0
+                for dsid in "${del_sids[@]}"; do
+                    if _oc_session_delete "$dsid"; then
+                        echo "✅ 已删除 $dsid"
+                        ((okc++))
+                    else
+                        echo "❌ 删除失败: $dsid"
+                        [ -n "$derr" ] && echo "     └─ 原因: $derr"
+                        ((failc++))
+                    fi
+                done
+                echo "删除完成: 成功 $okc / 失败 $failc"
+                # 刷新当前页并停留：重算总数与页码，越界回退；删空则开新会话
+                total=$(_oc_session_count)
+                total_pages=$(( (total + per_page - 1) / per_page ))
+                if [ "$total" = "0" ]; then
+                    echo "所有会话已删除"
+                    command opencode
+                    return
+                fi
+                [ "$page" -gt "$total_pages" ] && page=$total_pages
+                continue
+                ;;
             '') break ;;
             *)
-                if [[ "$reply" =~ ^[0-9]+$ ]] && [ "$reply" -ge 1 ] && [ "$reply" -le $page_count ]; then
+                if [[ "$reply" =~ ^[1-9][0-9]*$ ]] && [ "$reply" -ge 1 ] && [ "$reply" -le $page_count ]; then
                     sid=$(echo "${rows[$reply]}" | awk -F'│' '{print $1}') && break
                 fi
                 ;;
