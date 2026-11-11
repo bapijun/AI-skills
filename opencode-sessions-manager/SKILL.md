@@ -1,6 +1,6 @@
 ---
 name: opencode-sessions-manager
-version: 0.0.4
+version: 0.0.5
 description: |
   交互式 opencode 会话选择器 - 分页浏览恢复历史会话
   触发场景：
@@ -62,6 +62,7 @@ source "$RC_FILE"
 | 命令 | 效果 |
 |------|------|
 | `opencode_list` | 弹会话列表（显示项目名、标题、首条/倒二/末条用户输入），最新会话在最底部，1 号位离输入框最近 |
+| 列表内 `d` | 批量删除会话：单个 `3` / 多个 `3 5 8` / 区间 `2-5`（含两端）/ 混合 `2-5 8`，空格分隔，**仅当前页有效**；y/N 统一确认后逐条删除，删完自动刷新。**仅 v2**（v1 环境不显示该选项） |
 | `opencode web` | 原样透传 |
 | `opencode -s ses_xxx` | 原样透传 |
 | `opencode --help` | 原样透传 |
@@ -81,6 +82,17 @@ source "$RC_FILE"
 [dvlproadHexo的《AI-③opencode会话管理》](https://dvlproad.github.io/AI/AI-③opencode会话管理/)
 
 ## 版本记录
+
+### 0.0.5 (2026-11-11): 批量删除会话（多个 / 区间）
+
+- `opencode_list` 提示行新增 `d=删除`（仅 v2 环境显示；本版删除只支持 v2，v1 仅保留列表浏览）
+- 输入语法：单个 `3` / 多个 `3 5 8` / 区间 `2-5`（含两端，倒序自动纠正）/ 混合 `2-5 8`；空格分隔，仅当前页有效（每批 ≤ 页大小，与选号恢复的页内语义一致）
+- 严格校验：任何非法 / 越界 token **整批拒绝**并提示原因，绝不部分执行；按 sid 去重
+- 序号输入禁止前导零（zsh 数组下标按八进制解析，`010` 会错位到第 8 行导致误删）；非法输入整批拒绝
+- 修复历史遗留 bug：`while` 循环里重复 `local rows` / `local page_count`（以及再次进入 `d` 分支时的 `local del_reply ...`）会因 zsh `typeset_silent` 默认关闭而**打印旧值**，表现为第 2 页起每翻一页/每次按 `d` 都喷一坨 `rows=( ... ) page_count=10` 脏数据 → 函数内加 `setopt localoptions typeset_silent` 解决
+- 删除统一走官方 `opencode session delete`（自动级联子会话、事件表、session_message/inbox/pending），不手写 SQL
+- 删除前列出会话清单 + `y/N` 一次性确认；删除后刷新当前页并停留，页码越界自动回退，删空整个库则直接开新会话
+- 已知边界：删除其他终端正活跃的会话行为未验证；分隔符仅支持空格
 
 ### 0.0.4 (2026-11-02): v1/v2 版本自适应
 
