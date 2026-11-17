@@ -111,10 +111,129 @@ _oc_session_count() {
     fi
 }
 
-# 删除会话（走官方命令：级联删子会话+事件表+session_message/inbox/pending，不手写 SQL；仅 v2 提供删除入口）
-# 成功静默返回 0；失败把官方错误存入 derr（调用者的 local，zsh 动态作用域）并返回 1
+# ============================================================
+# v1 删除支持
+# opencode v1 没有 session delete 命令，只能直接改库，因此这里全部走 SQL。
+# ============================================================
+
+# SQL 字符串字面量转义（sid 来自本地库，仍做单引号翻倍防御）
+_oc_sql_str() { local s="${1//\'/\'\'}"; printf '%s' "$s"; }
+
+# 清空 v1 表结构自省缓存（每次进入删除流程时调用，保证读到最新结构）
+_oc_v1_meta_reset() {
+    _OC_V1_SID_TABLES=()
+    _OC_V1_MID_TABLES=()
+    _OC_V1_HAS_PARENT=0
+    _OC_V1_META_READY=""
+}
+
+# 运行时自省 v1 表结构（不硬编码表名，兼容 v1 各小版本差异）：
+#   _OC_V1_SID_TABLES：含 session_id 列的表 → 一级子表（如 message）
+#   _OC_V1_MID_TABLES：含 message_id 列的表 → 二级子表（如 part）
+#   _OC_V1_HAS_PARENT ：session 表是否有 parent_id 列 → 决定是否递归删子代
+# 结果缓存，同一批次内只扫一次
+_oc_v1_meta() {
+    [ -n "${_OC_V1_META_READY}" ] && return 0
+    _oc_v1_meta_reset
+    _OC_V1_META_READY=1
+    [ -f "$DB" ] || return 0
+    local t cols
+    for t in ${(f)"$(sqlite3 "$DB" "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';" 2>/dev/null)"}; do
+        [ -z "$t" ] && continue
+        cols=$(sqlite3 "$DB" "SELECT name FROM pragma_table_info('$t');" 2>/dev/null)
+        [ -z "$cols" ] && continue
+        print -r -- "$cols" | grep -qx 'session_id' && _OC_V1_SID_TABLES+=("$t")
+        print -r -- "$cols" | grep -qx 'message_id' && _OC_V1_MID_TABLES+=("$t")
+        if [ "$t" = "session" ] && print -r -- "$cols" | grep -qx 'parent_id'; then
+            _OC_V1_HAS_PARENT=1
+        fi
+    done
+    return 0
+}
+
+# 取会话的父会话 id（无父 / 无 parent_id 列 → 空字符串）
+_oc_session_parent() {
+    _oc_detect
+    [ -f "$DB" ] || { printf '' ; return 0 ; }
+    if [ "$_OC_DB_V2" = "1" ]; then
+        sqlite3 "$DB" "SELECT COALESCE(parent_id,'') FROM session_v2 WHERE id='$(_oc_sql_str "$1")';" 2>/dev/null
+    else
+        _oc_v1_meta
+        [ "$_OC_V1_HAS_PARENT" = "1" ] || { printf '' ; return 0 ; }
+        sqlite3 "$DB" "SELECT COALESCE(parent_id,'') FROM session WHERE id='$(_oc_sql_str "$1")';" 2>/dev/null
+    fi
+}
+
+# v1 会话删除：单事务级联（二级子表 → 一级子表 → session 行，含所有后代会话）
+# 关键：.bail on —— 任一语句失败立即中止，未 COMMIT 的事务随连接关闭自动回滚。
+#   实测：不加 .bail on 时 sqlite3 会继续执行后续语句并 COMMIT，即使退出码非零，
+#        数据也已部分提交（“删一半还报成功”）。
+_oc_session_delete_v1() {
+    derr=""
+    [ -f "$DB" ] || { derr="数据库不存在: $DB" ; return 1 ; }
+    local dsid scope t script has_msg ids id
+    dsid=$(_oc_sql_str "$1")
+    _oc_v1_meta
+
+    # 目标会话集合：有 parent_id 列则递归收集所有后代，否则只有自身
+    if [ "$_OC_V1_HAS_PARENT" = "1" ]; then
+        # 用 UNION（去重）而非 UNION ALL：parent_id 若有环，UNION ALL 会无限递归挂死
+        ids=$(sqlite3 "$DB" "
+            WITH RECURSIVE d(id) AS (
+                SELECT '$dsid'
+                UNION
+                SELECT s.id FROM session s JOIN d ON s.parent_id = d.id
+            )
+            SELECT id FROM d;" 2>&1)
+        local -a qids
+        qids=()
+        for id in ${(f)ids}; do
+            [ -z "$id" ] && continue
+            qids+=("'$(_oc_sql_str "$id")'")
+        done
+        scope=${(j:,:)qids}
+    fi
+    [ -z "$scope" ] && scope="'$dsid'"
+
+    script=".bail on
+.timeout 3000
+BEGIN;
+"
+    # 二级子表（如 part）：经 message 表定位
+    has_msg=0
+    for t in "${_OC_V1_SID_TABLES[@]}"; do [ "$t" = "message" ] && has_msg=1 ; done
+    if [ "$has_msg" = "1" ]; then
+        for t in "${_OC_V1_MID_TABLES[@]}"; do
+            script+="DELETE FROM \"$t\" WHERE message_id IN (SELECT id FROM message WHERE session_id IN ($scope));
+"
+        done
+    fi
+    # 一级子表（如 message）
+    for t in "${_OC_V1_SID_TABLES[@]}"; do
+        script+="DELETE FROM \"$t\" WHERE session_id IN ($scope);
+"
+    done
+    # session 行（含所有后代）
+    script+="DELETE FROM session WHERE id IN ($scope);
+COMMIT;
+"
+    if derr=$(printf '%s' "$script" | sqlite3 "$DB" 2>&1); then
+        derr=""
+        return 0
+    fi
+    return 1
+}
+
+# 删除会话：v2 走官方命令（级联子会话+事件表+session_message/inbox/pending，不手写 SQL）；
+#           v1 走 SQL 级联（见 _oc_session_delete_v1）
+# 成功返回 0；失败把原因存入 derr（调用者的 local，zsh 动态作用域）并返回 1
 _oc_session_delete() {
     derr=""
+    _oc_detect
+    if [ "$_OC_DB_V2" != "1" ]; then
+        _oc_session_delete_v1 "$1"
+        return $?
+    fi
     if derr=$(command opencode session delete "$1" 2>&1); then
         derr=""
         return 0
@@ -177,7 +296,7 @@ opencode_list() {
         local prompt="输入序号恢复"
         [[ $page -lt $total_pages ]] && prompt="${prompt}，\033[33mn\033[35m=下一页"
         [[ $page -gt 1 ]] && prompt="${prompt}，\033[33mp\033[35m=上一页"
-        [[ "$_OC_DB_V2" = "1" ]] && prompt="${prompt}，\033[33md\033[35m=删除"
+        prompt="${prompt}，\033[33md\033[35m=删除"
         prompt="${prompt}，直接回车=新会话，\033[33mq\033[35m=退出: "
         echo -ne "\033[35m${prompt}\033[0m"
         read -r reply
@@ -187,12 +306,12 @@ opencode_list() {
             n|N) [[ $page -lt $total_pages ]] && ((page++)) && continue ;;
             p|P) [[ $page -gt 1 ]] && ((page--)) && continue ;;
             d|D)
-                # 批量删除（仅 v2）：单个 3 / 多个 3 5 8 / 区间 2-5 / 混合 2-5 8；仅当前页有效，空格分隔
-                if [ "$_OC_DB_V2" != "1" ]; then echo "ℹ️ 当前为 v1 环境，不支持删除（仅 v2 提供该功能）" ; continue ; fi
+                # 批量删除（v1/v2）：单个 3 / 多个 3 5 8 / 区间 2-5 / 混合 2-5 8；仅当前页有效，空格分隔
                 setopt localoptions noglob
-                local del_reply tok from to t n bad yn okc failc dsid dproj dttl dup s derr
-                local -a del_nums del_sids
+                local del_reply tok from to t n bad yn okc failc dsid dproj dttl dup s derr ant depth dropped
+                local -a del_nums del_sids del_no del_pj del_tt keep_sids keep_no keep_pj keep_tt casc_no casc_tt
                 del_nums=() ; del_sids=() ; bad=0
+                _oc_v1_meta_reset   # 重新自省 v1 表结构（表结构可能已变化）
                 echo -ne "\033[35m删除序号(单个 3 / 多个 3 5 8 / 区间 2-5 / 混合 2-5 8，当前页内)，回车取消: \033[0m"
                 read -r del_reply
                 [ -z "$del_reply" ] && continue
@@ -216,8 +335,7 @@ opencode_list() {
                     fi
                 done
                 [ "$bad" = "1" ] && continue
-                # 预览 + 按 sid 去重（避免 "3 2-4" 里 3 重复删）
-                echo "将删除以下会话(含其子会话):"
+                # 按 sid 去重（避免 "3 2-4" 里 3 重复删），同时保留展示信息
                 for n in "${del_nums[@]}"; do
                     dsid=$(echo "${rows[$n]}" | awk -F'│' '{print $1}')
                     dproj=$(echo "${rows[$n]}" | awk -F'│' '{print $2}')
@@ -225,17 +343,48 @@ opencode_list() {
                     dup=0
                     for s in "${del_sids[@]}"; do [ "$s" = "$dsid" ] && dup=1 && break; done
                     if [ "$dup" = "0" ]; then
-                        del_sids+=("$dsid")
-                        printf "  %2d) \033[1;36m[%s]\033[0m \033[1;32m%s\033[0m\n" "$n" "${dproj:-?}" "${dttl:-}"
+                        del_sids+=("$dsid") ; del_no+=("$n") ; del_pj+=("${dproj:-?}") ; del_tt+=("${dttl:-}")
                     fi
                 done
+                # 父子重叠过滤：祖先也在本批里 → 子会话会被父级联删掉，从执行列表剔除
+                # （否则子会话删不到会显示成 ❌，统计误导）。v2 官方命令与 v1 递归删除都级联子代，故两者共用。
+                for ((t=1; t<=${#del_sids[@]}; t++)); do
+                    s=${del_sids[$t]} ; dropped=0 ; depth=0
+                    ant=$(_oc_session_parent "$s")
+                    while [ -n "$ant" ] && [ "$depth" -lt 10 ]; do
+                        for dsid in "${del_sids[@]}"; do
+                            [ "$dsid" = "$s" ] && continue
+                            [ "$dsid" = "$ant" ] && dropped=1 && break
+                        done
+                        [ "$dropped" = "1" ] && break
+                        ant=$(_oc_session_parent "$ant")
+                        ((depth++))
+                    done
+                    if [ "$dropped" = "1" ]; then
+                        casc_no+=("${del_no[$t]}") ; casc_tt+=("${del_tt[$t]}")
+                    else
+                        keep_sids+=("$s") ; keep_no+=("${del_no[$t]}") ; keep_pj+=("${del_pj[$t]}") ; keep_tt+=("${del_tt[$t]}")
+                    fi
+                done
+                if [ "${#keep_sids[@]}" -eq 0 ]; then
+                    echo "❌ 无有效删除目标（父子关系异常），已取消" ; continue
+                fi
+                echo "将删除以下会话(含其子会话):"
+                for ((t=1; t<=${#keep_sids[@]}; t++)); do
+                    printf "  %2d) \033[1;36m[%s]\033[0m \033[1;32m%s\033[0m\n" "${keep_no[$t]}" "${keep_pj[$t]}" "${keep_tt[$t]}"
+                done
+                for ((t=1; t<=${#casc_no[@]}; t++)); do
+                    printf "  \033[2m(级联) %2d) %s — 将随父会话一起删除\033[0m\n" "${casc_no[$t]}" "${casc_tt[$t]}"
+                done
+                # v1 没有官方命令兜底、也无自动备份，删前明确提醒
+                [ "$_OC_DB_V2" != "1" ] && echo -e "\033[33m⚠️  v1 为直接改库且无自动备份，删除不可逆\033[0m"
                 # 统一 y/N 确认一次
-                echo -ne "\033[35m确认删除以上 ${#del_sids[@]} 个会话? y/N: \033[0m"
+                echo -ne "\033[35m确认删除以上 ${#keep_sids[@]} 个会话? y/N: \033[0m"
                 read -r yn
                 [[ "$yn" =~ ^[yY]$ ]] || { echo "已取消删除" ; continue ; }
                 # 逐条删除，统计成败
                 okc=0 ; failc=0
-                for dsid in "${del_sids[@]}"; do
+                for dsid in "${keep_sids[@]}"; do
                     if _oc_session_delete "$dsid"; then
                         echo "✅ 已删除 $dsid"
                         ((okc++))
